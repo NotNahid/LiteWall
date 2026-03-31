@@ -29,11 +29,22 @@ def install_pyinstaller():
 def build_exe(py_file):
     print(f"[INFO] Building EXE for: {py_file}")
 
+    # Check if icon exists
+    icon_path = "notnahid.ico"
+    if not os.path.exists(icon_path):
+        print("[WARNING] Icon file not found, building without icon.")
+        icon_flag = []
+    else:
+        icon_flag = [f"--icon={icon_path}"]
+
     command = [
         sys.executable,
         "-m",
         "PyInstaller",
         "--onefile",
+        "--noconsole",
+        "--clean",
+        *icon_flag,
         py_file
     ]
 
