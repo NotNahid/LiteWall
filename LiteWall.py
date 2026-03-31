@@ -319,23 +319,10 @@ def restore_original_wallpaper() -> None:
 
     log.info("Restoring original wallpaper: %s", wp if wp else "(solid color)")
     try:
-        u32 = ctypes.windll.user32
-
-        # Step 1 — tell Windows to set the wallpaper back
-        u32.SystemParametersInfoW(
+        ctypes.windll.user32.SystemParametersInfoW(
             SPI_SETDESKWALLPAPER, 0, wp,
             SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
         )
-
-        # Step 2 — give Windows a moment to actually paint the wallpaper
-        # before we return (without this you get a black flash)
-        time.sleep(0.15)
-
-        # Step 3 — force a full desktop repaint so the wallpaper appears
-        # immediately rather than waiting for the next natural refresh
-        u32.InvalidateRect(None, None, True)
-        u32.UpdateWindow(u32.GetDesktopWindow())
-
     except Exception as exc:
         log.warning("Failed to restore wallpaper: %s", exc)
 
@@ -461,35 +448,9 @@ def vlc_is_ready() -> bool:
 #  Desktop embedding helpers (Win32)
 # ──────────────────────────────────────────────────────────────────────────────
 def restore_desktop() -> None:
-    """
-    Restore Explorer's desktop layer after we're done with WorkerW.
-
-    The original code only called ShowWindow(workerw, 5) — that makes the
-    WorkerW visible again but SHELLDLL_DefView (desktop icons / renderer)
-    is still orphaned from when we embedded into it. This causes the desktop
-    to freeze until Explorer is manually restarted.
-
-    Fix: re-send 0x052C to Progman which tells Explorer to fully rebuild
-    the WorkerW ownership chain, then hide the now-clean WorkerW so the
-    normal desktop renders on top of it correctly.
-    """
     try:
-        u32     = ctypes.windll.user32
-        progman = u32.FindWindowW("Progman", None)
-        if not progman:
-            log.debug("restore_desktop: Progman not found")
-            return
-
-        # Re-trigger Explorer's WorkerW rebuild — this re-parents
-        # SHELLDLL_DefView correctly and un-orphans the desktop renderer
-        u32.SendMessageTimeoutW(progman, 0x052C, 0, 0, 0, 2000,
-                                ctypes.byref(ctypes.c_ulong()))
-
-        # Small wait for Explorer to finish rebuilding its window tree
-        time.sleep(0.1)
-
-        # Now find and HIDE the WorkerW — the normal desktop sits above it
-        ww = ctypes.c_void_p(None)
+        u32 = ctypes.windll.user32
+        ww  = ctypes.c_void_p(None)
 
         def _cb(hwnd, _):
             if u32.FindWindowExW(hwnd, None, "SHELLDLL_DefView", None):
@@ -502,58 +463,19 @@ def restore_desktop() -> None:
             ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(_cb), 0
         )
         if ww.value:
-            # SW_HIDE = 0, not SW_SHOW — WorkerW should be hidden after restore
-            # so normal desktop rendering takes over
-            u32.ShowWindow(ww.value, 0)
-
-        # Force the desktop window to repaint immediately
-        hwnd_desk = u32.GetDesktopWindow()
-        u32.InvalidateRect(hwnd_desk, None, True)
-        u32.UpdateWindow(hwnd_desk)
-
-        log.debug("restore_desktop: desktop layer rebuilt successfully")
+            u32.ShowWindow(ww.value, 5)
     except Exception as exc:
         log.debug("restore_desktop: %s", exc)
 
 
-_cached_workerw: Optional[int] = None  # cached after first successful lookup
-
-
-def _get_workerw(force_refresh: bool = False) -> Optional[int]:
-    """
-    Return the WorkerW (or Progman) handle used for desktop embedding.
-
-    The handle is cached after the first successful lookup — re-enumeration
-    only happens when force_refresh=True (e.g. after Explorer restarts).
-
-    Key changes vs original:
-      • Timeout raised 1000 → 2000 ms so Explorer isn't hammered on slow machines
-      • Blind time.sleep(0.3) removed — we block inside SendMessageTimeout itself
-      • Result cached so Explorer's message queue is only interrupted once
-    """
-    global _cached_workerw
-
-    if _cached_workerw and not force_refresh:
-        # Verify the cached handle is still alive before returning it
-        u32 = ctypes.windll.user32
-        if u32.IsWindow(_cached_workerw):
-            return _cached_workerw
-        # Handle gone (Explorer restarted) — fall through to re-enumerate
-        log.debug("_get_workerw: cached handle invalid, re-enumerating")
-        _cached_workerw = None
-
+def _get_workerw() -> Optional[int]:
     u32     = ctypes.windll.user32
     progman = u32.FindWindowW("Progman", None)
     if not progman:
         return None
-
-    # 0x052C forces Progman to spawn the WorkerW layer.
-    # Timeout raised to 2000 ms — gives Explorer more breathing room,
-    # which paradoxically causes LESS lag than a tight 1000 ms timeout.
-    u32.SendMessageTimeoutW(progman, 0x052C, 0, 0, 0, 2000,
+    u32.SendMessageTimeoutW(progman, 0x052C, 0, 0, 0, 1000,
                             ctypes.byref(ctypes.c_ulong()))
-    # No sleep here — SendMessageTimeout already blocks until Explorer responds.
-
+    time.sleep(0.3)
     ww = ctypes.c_void_p(None)
 
     def _cb(hwnd, _):
@@ -566,11 +488,7 @@ def _get_workerw(force_refresh: bool = False) -> Optional[int]:
     u32.EnumWindows(
         ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(_cb), 0
     )
-    result = ww.value or progman
-    if result:
-        _cached_workerw = result
-        log.debug("_get_workerw: handle cached (0x%x)", result)
-    return result
+    return ww.value or progman
 
 
 def _create_child_window(parent: int, w: int, h: int) -> int:
@@ -639,10 +557,6 @@ def start_wallpaper(
     sw  = u32.GetSystemMetrics(0)
     sh  = u32.GetSystemMetrics(1)
 
-    # _get_workerw is called here (already on the wallpaper worker thread,
-    # never on the UI thread) so Explorer's message queue interruption
-    # never freezes the GUI. The cached handle means subsequent calls
-    # to start_wallpaper skip the SendMessageTimeout entirely.
     workerw = _get_workerw()
     if not workerw:
         raise RuntimeError("Could not find WorkerW / Progman handle.\n"
@@ -661,15 +575,11 @@ def start_wallpaper(
             "--avcodec-hw=any",
             "--file-caching=500",
             "--no-snapshot-preview",
-            "--input-repeat=-1",   # true infinite loop — avoids VLC 3.x memory
-                                   # leak caused by very large repeat counts
         )
         player = inst.media_player_new()
         media  = inst.media_new(str(video_path))
         if loop:
-            media.add_option("input-repeat=65535")  # ✅ restore looping
-        else:
-            media.add_option("input-repeat=0")   # play once then stop
+            media.add_option("input-repeat=65535")
         player.set_media(media)
         media.release()
         player.set_hwnd(embed)
@@ -694,7 +604,6 @@ def start_wallpaper(
 
 
 def stop_wallpaper(restore_wp: bool = True) -> None:
-    global _cached_workerw
     with _ws_lock:
         if _ws.player:
             try:
@@ -717,23 +626,13 @@ def stop_wallpaper(restore_wp: bool = True) -> None:
                 log.debug("DestroyWindow: %s", exc)
             _ws.embed_hwnd = 0
 
-        # Invalidate the WorkerW cache — embed window is gone, next
-        # start_wallpaper will re-verify the handle is still valid
-        _cached_workerw = None
-
         _ws.path = None
-
-    # Restore the original wallpaper FIRST (before hiding WorkerW) so
-    # Windows has already painted it by the time WorkerW disappears.
-    # Previous order was wrong — hiding WorkerW first left a black frame.
-    if restore_wp:
-        restore_original_wallpaper()
-        clear_persist_state()
 
     restore_desktop()
 
-    if not restore_wp:
-        pass   # restore_desktop still hides WorkerW cleanly without restoring wp
+    if restore_wp:
+        restore_original_wallpaper()
+        clear_persist_state()
 
     log.info("Wallpaper stopped (restore_wp=%s).", restore_wp)
 
