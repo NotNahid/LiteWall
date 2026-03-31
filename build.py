@@ -1,33 +1,33 @@
+# -*- coding: utf-8 -*-
+
 import os
 import subprocess
 import sys
 
 def find_py_file():
-    # Get all .py files in current folder
     py_files = [f for f in os.listdir() if f.endswith(".py") and f != "build.py"]
     
     if not py_files:
-        print("❌ No .py file found in this folder!")
-        sys.exit()
+        print("[ERROR] No .py file found in this folder!")
+        sys.exit(1)
 
     if len(py_files) == 1:
         return py_files[0]
 
-    # If multiple files exist, pick the first one
-    print("⚠ Multiple .py files found. Using:", py_files[0])
+    print("[WARNING] Multiple .py files found. Using:", py_files[0])
     return py_files[0]
 
 
 def install_pyinstaller():
     try:
-        import pyinstaller
+        import PyInstaller
     except ImportError:
-        print("📦 Installing PyInstaller...")
+        print("[INFO] Installing PyInstaller...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
 
 
 def build_exe(py_file):
-    print(f"🚀 Building EXE for: {py_file}")
+    print(f"[INFO] Building EXE for: {py_file}")
 
     command = [
         sys.executable,
@@ -37,10 +37,10 @@ def build_exe(py_file):
         py_file
     ]
 
-    subprocess.run(command)
+    subprocess.check_call(command)
 
-    print("\n✅ Done!")
-    print("📁 Check the 'dist' folder for your EXE file.")
+    print("\n[SUCCESS] Done!")
+    print("[INFO] Check the 'dist' folder for your EXE file.")
 
 
 if __name__ == "__main__":
