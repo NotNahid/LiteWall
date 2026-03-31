@@ -34,6 +34,7 @@ for _pkg, _imp in [
     ("customtkinter",  "customtkinter"),
     ("pystray",        "pystray"),
     ("Pillow",         "PIL"),
+    ("pywin32",        "win32com"),   # WScript.Shell for .lnk shortcut creation
 ]:
     if _imp and importlib.util.find_spec(_imp) is None:
         try: print(f"Installing {_pkg}…")
@@ -123,10 +124,6 @@ VLC_ZIP_VERSION     = "vlc-3.0.18"
 SUPPORTED = (".mp4", ".mkv", ".avi", ".mov", ".webm", ".gif", ".wmv", ".flv", ".m4v")
 MAX_RECENT = 10
 
-# Windows Registry key for startup
-STARTUP_REG_KEY  = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
-STARTUP_REG_NAME = "LiveWallpaper"
-
 # ──────────────────────────────────────────────────────────────────────────────
 #  Win32 constants for wallpaper save/restore
 # ──────────────────────────────────────────────────────────────────────────────
@@ -169,66 +166,97 @@ def save_settings(s: dict) -> None:
         log.warning("Could not save settings: %s", exc)
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Windows Startup Registry management
+#  Windows Startup — shell:startup shortcut (.lnk)
+#
+#  Why not Registry?
+#  • shell:startup shortcuts require zero elevated permissions.
+#  • They don't trigger Windows Defender / SmartScreen warnings that Registry
+#    Run keys written by unknown publishers tend to cause.
+#  • Visible and manageable by the user in Task Manager → Startup Apps.
+#  • Works identically for both the .py source and a PyInstaller .exe.
+#
+#  How it works:
+#  • We drop  "LiveWallpaper.lnk"  into the per-user Startup folder:
+#      %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\
+#  • The shortcut targets the .exe (frozen) or python.exe + script (dev),
+#    passes --headless, and sets the working directory to the exe/script folder.
+#  • On removal we simply delete the .lnk file.
 # ──────────────────────────────────────────────────────────────────────────────
-def _get_startup_command() -> str:
-    """Build the command that Windows should run at login."""
-    if getattr(sys, "frozen", False):
-        # Compiled .exe
-        return f'"{SCRIPT_PATH}" --headless'
-    else:
-        # Running as .py script
-        return f'"{sys.executable}" "{SCRIPT_PATH}" --headless'
+
+# shell:startup folder path (always exists for every Windows user)
+_STARTUP_FOLDER = Path(os.environ.get("APPDATA", Path.home())) / \
+    "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+_STARTUP_LNK    = _STARTUP_FOLDER / "LiveWallpaper.lnk"
+
+
+def _create_shortcut(lnk_path: Path, target: str, args: str,
+                     workdir: str, description: str) -> None:
+    """
+    Create a Windows .lnk shortcut using the WScript.Shell COM object.
+    No admin rights required. Works in both .py and frozen .exe contexts.
+    """
+    import win32com.client          # part of pywin32 (bundled by PyInstaller)
+    shell    = win32com.client.Dispatch("WScript.Shell")
+    shortcut = shell.CreateShortcut(str(lnk_path))
+    shortcut.TargetPath       = target
+    shortcut.Arguments        = args
+    shortcut.WorkingDirectory = workdir
+    shortcut.Description      = description
+    shortcut.WindowStyle      = 7   # SW_SHOWMINNOACTIVE — start minimised/hidden
+    shortcut.Save()
 
 
 def add_to_startup() -> bool:
-    """Add this app to Windows startup via Registry."""
+    """
+    Drop LiveWallpaper.lnk into the user's shell:startup folder.
+    No Registry writes, no UAC prompt, no Defender warning.
+    """
     try:
-        cmd = _get_startup_command()
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY,
-            0, winreg.KEY_SET_VALUE
-        ) as key:
-            winreg.SetValueEx(key, STARTUP_REG_NAME, 0, winreg.REG_SZ, cmd)
-        log.info("Added to Windows startup: %s", cmd)
+        _STARTUP_FOLDER.mkdir(parents=True, exist_ok=True)
+
+        if getattr(sys, "frozen", False):
+            # PyInstaller .exe — target is the exe itself
+            target  = str(SCRIPT_PATH)
+            args    = "--headless"
+            workdir = str(SCRIPT_PATH.parent)
+        else:
+            # Running as plain .py (development)
+            target  = sys.executable
+            args    = f'"{SCRIPT_PATH}" --headless'
+            workdir = str(SCRIPT_DIR)
+
+        _create_shortcut(
+            lnk_path    = _STARTUP_LNK,
+            target      = target,
+            args        = args,
+            workdir     = workdir,
+            description = "Live Wallpaper — headless background mode",
+        )
+        log.info("Startup shortcut created: %s  →  %s %s", _STARTUP_LNK, target, args)
         return True
+
     except Exception as exc:
-        log.error("Failed to add to startup: %s", exc)
+        log.error("Failed to create startup shortcut: %s", exc)
         return False
 
 
 def remove_from_startup() -> bool:
-    """Remove this app from Windows startup."""
+    """Delete the .lnk from shell:startup if it exists."""
     try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY,
-            0, winreg.KEY_SET_VALUE
-        ) as key:
-            try:
-                winreg.DeleteValue(key, STARTUP_REG_NAME)
-            except FileNotFoundError:
-                pass  # Already not there
-        log.info("Removed from Windows startup.")
+        if _STARTUP_LNK.is_file():
+            _STARTUP_LNK.unlink()
+            log.info("Startup shortcut removed: %s", _STARTUP_LNK)
+        else:
+            log.debug("remove_from_startup: shortcut not found (already gone).")
         return True
     except Exception as exc:
-        log.error("Failed to remove from startup: %s", exc)
+        log.error("Failed to remove startup shortcut: %s", exc)
         return False
 
 
 def is_in_startup() -> bool:
-    """Check if we're currently registered in Windows startup."""
-    try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, STARTUP_REG_KEY,
-            0, winreg.KEY_READ
-        ) as key:
-            try:
-                winreg.QueryValueEx(key, STARTUP_REG_NAME)
-                return True
-            except FileNotFoundError:
-                return False
-    except Exception:
-        return False
+    """Return True if our .lnk exists in shell:startup."""
+    return _STARTUP_LNK.is_file()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1645,25 +1673,39 @@ class App(ctk.CTk):
         self._settings["survive_reboot"] = enabled
 
         if enabled:
-            # Also enable persist_on_close (required for reboot survival)
+            # persist_on_close is required for reboot survival
             self._persist_var.set(True)
             self._settings["persist_on_close"] = True
 
+            # Write persist.json RIGHT NOW so that a forced reboot (Windows
+            # Update, power cut) before the user closes the app still has a
+            # valid state file to load on next boot.
+            if self._is_playing and _ws.path:
+                save_persist_state(
+                    playing=True,
+                    video_path=_ws.path,
+                    mute=self._mute_var.get(),
+                    volume=self._vol_var.get(),
+                    speed=self._speed_var.get(),
+                    loop=self._loop_var.get(),
+                )
+                log.info("Persist state written eagerly for reboot-survive.")
+
             ok = add_to_startup()
             if ok:
-                self._set_status("✓ Added to Windows startup — wallpaper will survive reboots")
-                log.info("Added to Windows startup registry.")
+                self._set_status("✓ Startup shortcut created — wallpaper will survive reboots")
+                log.info("Startup shortcut added to shell:startup.")
             else:
                 self._reboot_var.set(False)
                 self._settings["survive_reboot"] = False
-                self._set_status("✗ Failed to add to Windows startup", error=True)
+                self._set_status("✗ Failed to create startup shortcut", error=True)
         else:
             ok = remove_from_startup()
             if ok:
-                self._set_status("Removed from Windows startup")
-                log.info("Removed from Windows startup registry.")
+                self._set_status("Startup shortcut removed")
+                log.info("Startup shortcut removed from shell:startup.")
             else:
-                self._set_status("⚠ Could not remove startup entry", error=True)
+                self._set_status("⚠ Could not remove startup shortcut", error=True)
 
         self._save_settings()
         self._update_startup_status()
@@ -1673,14 +1715,15 @@ class App(ctk.CTk):
         in_startup = is_in_startup()
         if in_startup:
             self._startup_status.configure(
-                text="✓  Registered in Windows startup (HKCU\\…\\Run)",
+                text=f"✓  Startup shortcut active  ({_STARTUP_LNK.name})",
                 text_color=_SUCCESS,
             )
-            # Sync toggle state
+            # Sync toggle if the shortcut exists but toggle is off
+            # (e.g. user opened the Startup folder and didn't delete it)
             self._reboot_var.set(True)
         else:
             self._startup_status.configure(
-                text="Not registered in Windows startup",
+                text="No startup shortcut — wallpaper won't auto-start on boot",
                 text_color=_FG3,
             )
 
